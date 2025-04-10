@@ -1,10 +1,13 @@
 use clap::Parser;
 use indexmap::IndexMap;
 use miette::IntoDiagnostic;
-use pixi_config::ConfigCli;
+use pixi_config::{Config, ConfigCli};
 use pixi_manifest::{FeatureName, SpecType};
 use pixi_spec::{GitSpec, SourceSpec};
-use rattler_conda_types::{MatchSpec, PackageName};
+use rattler_conda_types::{MatchSpec, PackageName, Platform};
+use std::future::IntoFuture;
+use rattler_conda_types::StringMatcher::Regex;
+use pixi_progress::await_in_progress;
 
 use super::{cli_config::LockFileUpdateConfig, has_specs::HasSpecs};
 use crate::{
@@ -12,7 +15,11 @@ use crate::{
     environment::sanity_check_project,
     workspace::DependencyType,
     WorkspaceLocator,
+    Workspace
 };
+use crate::cli::cli_config::ChannelsConfig;
+use crate::cli::search::search_package_by_wildcard;
+use crate::global::Project;
 
 /// Adds dependencies to the workspace
 ///
@@ -190,6 +197,26 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         }
         Err(e) => {
             workspace.revert().await.into_diagnostic()?;
+
+            let workspace = WorkspaceLocator::for_cli()
+                .with_search_start(workspace_config.workspace_locator_start())
+                .locate()?
+                .with_cli_config(args.config.clone());
+
+            if let Some(package_name) = is_package_not_found(&e) {
+                let similar = search_similar_packages(&package_name, &workspace)
+                    .await
+                    .unwrap_or_default();
+                if similar.is_empty() {
+                    return Err(e);
+                }
+                let suggestions =  format!("{}{}", "\n - ", similar.join("\n - "));
+                return Err(miette::miette!(
+                    help = format!("Did you mean one of these?\n{}\nTip: Run `pixi search` to explore available packages.", suggestions),
+                    "Cannot solve the request because of: No candidates were found for {} *",
+                    package_name));
+            }
+
             return Err(e);
         }
     };
@@ -200,4 +227,62 @@ pub async fn execute(args: Args) -> miette::Result<()> {
     }
 
     Ok(())
+}
+
+fn is_package_not_found(err: &miette::Report) -> Option<String> {
+    let cause = err.root_cause().to_string();
+
+    let pattern = r"No candidates were found for (\w+)";
+    let matched = regex::Regex::new(pattern).expect("Compile regex");
+
+    matched.captures(&cause).map(|captures| captures[1].to_string())
+}
+
+async fn search_similar_packages(
+    search_term: &str,
+    workspace: &Workspace
+) -> miette::Result<Vec<String>> {
+    let channels = ChannelsConfig::default().resolve_from_project(Some(workspace))?;
+    let package_name = PackageName::try_from(search_term).into_diagnostic()?;
+
+    let client = workspace.authenticated_client().cloned()?;
+
+    let gateway = Config::load_global().gateway().with_client(client).finish();
+    let all_names = await_in_progress("loading all package names", |_| async {
+        gateway
+            .names(channels.clone(), [Platform::current(), Platform::NoArch])
+            .await
+    })
+        .await
+        .into_diagnostic()?;
+
+    let repodata_query_func = |some_specs: Vec<MatchSpec>| {
+        gateway
+            .query(
+                channels.clone(),
+                [Platform::current(), Platform::NoArch],
+                some_specs.clone(),
+            )
+            .into_future()
+    };
+
+    let search_result = search_package_by_wildcard(
+        package_name,
+        &format!("*{}*", search_term),
+        all_names,
+        repodata_query_func,
+        None, // this limit only applies to whatever will be printed during the process, but not to what will be returned
+        &mut std::io::empty(), // we don't want to print anything
+    )
+        .await;
+
+    if let Ok(Some(search_result)) = search_result {
+        return Ok(search_result
+            .into_iter()
+            .map(|r| r.package_record.name.as_normalized().to_owned())
+            .take(5) // real limit
+            .collect());
+    }
+
+    Ok(vec![])
 }
