@@ -3,23 +3,21 @@ use indexmap::IndexMap;
 use miette::IntoDiagnostic;
 use pixi_config::{Config, ConfigCli};
 use pixi_manifest::{FeatureName, SpecType};
+use pixi_progress::await_in_progress;
 use pixi_spec::{GitSpec, SourceSpec};
 use rattler_conda_types::{MatchSpec, PackageName, Platform};
 use std::future::IntoFuture;
-use rattler_conda_types::StringMatcher::Regex;
-use pixi_progress::await_in_progress;
+use tokio::time::timeout;
 
 use super::{cli_config::LockFileUpdateConfig, has_specs::HasSpecs};
+use crate::cli::cli_config::ChannelsConfig;
+use crate::cli::search::search_package_by_wildcard;
 use crate::{
     cli::cli_config::{DependencyConfig, PrefixUpdateConfig, WorkspaceConfig},
     environment::sanity_check_project,
     workspace::DependencyType,
-    WorkspaceLocator,
-    Workspace
+    Workspace, WorkspaceLocator,
 };
-use crate::cli::cli_config::ChannelsConfig;
-use crate::cli::search::search_package_by_wildcard;
-use crate::global::Project;
 
 /// Adds dependencies to the workspace
 ///
@@ -196,27 +194,25 @@ pub async fn execute(args: Args) -> miette::Result<()> {
             update_deps
         }
         Err(e) => {
-            workspace.revert().await.into_diagnostic()?;
-
-            let workspace = WorkspaceLocator::for_cli()
-                .with_search_start(workspace_config.workspace_locator_start())
-                .locate()?
-                .with_cli_config(args.config.clone());
+            let workspace = workspace.revert().await.into_diagnostic()?;
 
             if let Some(package_name) = is_package_not_found(&e) {
-                let similar = search_similar_packages(&package_name, &workspace)
-                    .await
-                    .unwrap_or_default();
-                if similar.is_empty() {
+                let timeout_duration = std::time::Duration::from_secs(1);
+                if let Ok(Ok(similar_packages)) = timeout(
+                    timeout_duration,
+                    search_similar_packages(&package_name, &workspace),
+                )
+                .await
+                {
+                    let suggestions = format!("{}{}", "\n - ", similar_packages.join("\n - "));
+                    return Err(miette::miette!(
+                    help = format!("Did you mean one of these?\n{}\nTip: Run `pixi search` to explore available packages.", suggestions),
+                    "{}", e
+                   ).wrap_err(format!("No candidates were found for {}", package_name)));
+                } else {
                     return Err(e);
                 }
-                let suggestions =  format!("{}{}", "\n - ", similar.join("\n - "));
-                return Err(miette::miette!(
-                    help = format!("Did you mean one of these?\n{}\nTip: Run `pixi search` to explore available packages.", suggestions),
-                    "Cannot solve the request because of: No candidates were found for {} *",
-                    package_name));
             }
-
             return Err(e);
         }
     };
@@ -233,14 +229,14 @@ fn is_package_not_found(err: &miette::Report) -> Option<String> {
     let cause = err.root_cause().to_string();
 
     let pattern = r"No candidates were found for (\w+)";
-    let matched = regex::Regex::new(pattern).expect("Compile regex");
+    let matched = regex::Regex::new(pattern).expect("Should compile regex");
 
-    matched.captures(&cause).map(|captures| captures[1].to_string())
+    matched.captures(&cause).map(|c| c[1].to_string())
 }
 
 async fn search_similar_packages(
     search_term: &str,
-    workspace: &Workspace
+    workspace: &Workspace,
 ) -> miette::Result<Vec<String>> {
     let channels = ChannelsConfig::default().resolve_from_project(Some(workspace))?;
     let package_name = PackageName::try_from(search_term).into_diagnostic()?;
@@ -253,8 +249,8 @@ async fn search_similar_packages(
             .names(channels.clone(), [Platform::current(), Platform::NoArch])
             .await
     })
-        .await
-        .into_diagnostic()?;
+    .await
+    .into_diagnostic()?;
 
     let repodata_query_func = |some_specs: Vec<MatchSpec>| {
         gateway
@@ -274,12 +270,18 @@ async fn search_similar_packages(
         None, // this limit only applies to whatever will be printed during the process, but not to what will be returned
         &mut std::io::empty(), // we don't want to print anything
     )
-        .await;
+    .await;
 
     if let Ok(Some(search_result)) = search_result {
         return Ok(search_result
             .into_iter()
-            .map(|r| r.package_record.name.as_normalized().to_owned())
+            .map(|r| {
+                format!(
+                    "{} ({})",
+                    r.package_record.name.as_normalized().to_owned(),
+                    r.package_record.version.as_str()
+                )
+            })
             .take(5) // real limit
             .collect());
     }

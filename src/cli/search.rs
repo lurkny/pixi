@@ -592,5 +592,3 @@ fn print_matching_packages<W: Write>(
 
     Ok(())
 }
-
-
